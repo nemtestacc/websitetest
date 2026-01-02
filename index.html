@@ -631,10 +631,11 @@
 
         // init
         if (typeof timeData !== 'undefined' && timeData.length > 0) {
-            slider.max = timeData.length - 1;
-            slider.value = 0;
+            const lastIndex = timeData.length - 1;
+            slider.max = lastIndex;
+            slider.value = lastIndex;
             resizeTimelineCanvas();
-            updateDashboard(0);
+            updateDashboard(lastIndex);
         } else {
             alert("Error: Data could not be loaded. Please ensure data.js is present and valid.");
         }
