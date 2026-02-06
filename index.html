@@ -208,6 +208,38 @@
         }
         #chartCloseBtn:hover { background: #f0f0f0; }
 
+        #chartReadout {
+            color: #333;
+        }
+        #chartCanvas {
+            touch-action: none; /* allow pinch/drag without page scroll */
+        }
+
+        /* Mobile-friendly modal */
+        @media (max-width: 640px) {
+            #chartModalOverlay { padding: 0; }
+            #chartModal {
+                width: 100vw;
+                height: 100vh;
+                border-radius: 0;
+            }
+            #chartModalHeader {
+                align-items: flex-start;
+                flex-direction: column;
+                gap: 8px;
+            }
+            #chartModalHeader .left {
+                width: 100%;
+            }
+            #chartModalHeader .title {
+                font-size: 14px;
+            }
+            #chartModalHeader select, #chartModalHeader button, #chartCloseBtn {
+                font-size: 14px;
+                padding: 8px 10px;
+            }
+        }
+
     </style>
 
     <!-- Chart.js (for popup charts) -->
@@ -278,6 +310,7 @@
                     </label>
 
                     <button id="resetZoomBtn" title="Reset zoom">Reset zoom</button>
+                <span id="chartReadout" style="font-weight:600; margin-left:6px; white-space:nowrap;"></span>
                 </div>
                 <button id="chartCloseBtn" title="Close">Close</button>
             </div>
@@ -726,11 +759,50 @@
             return { labels, values };
         }
 
+        
+        function formatNumber(v) {
+            if (v === null || v === undefined || Number.isNaN(v)) return '—';
+            const abs = Math.abs(v);
+            if (abs >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+            if (abs >= 100) return v.toLocaleString(undefined, { maximumFractionDigits: 1 });
+            return v.toLocaleString(undefined, { maximumFractionDigits: 2 });
+        }
+
+        function attachReadoutHandlers(chart, metric) {
+            const canvas = chart.canvas;
+            const readout = document.getElementById('chartReadout');
+            if (!canvas || !readout) return;
+
+            const updateFromEvent = (evt) => {
+                const points = chart.getElementsAtEventForMode(evt, 'index', { intersect: false }, true);
+                if (!points || !points.length) return;
+                const p = points[0];
+                const label = chart.data.labels[p.index];
+                const value = chart.data.datasets[p.datasetIndex].data[p.index];
+                readout.textContent = `${label}  |  ${metric}: ${formatNumber(value)}`;
+            };
+
+            // Mouse / pointer
+            canvas.onpointerdown = (e) => { updateFromEvent(e); canvas.setPointerCapture?.(e.pointerId); };
+            canvas.onpointermove = (e) => { if (e.buttons) updateFromEvent(e); };
+            canvas.onpointerup = () => {};
+
+            // Touch (some browsers don't route to pointer reliably)
+            canvas.ontouchstart = (e) => { if (e.touches?.[0]) updateFromEvent(e); };
+            canvas.ontouchmove = (e) => {
+                // prevent page scroll while scrubbing values
+                e.preventDefault();
+                updateFromEvent(e);
+            };
+        }
+
         function openChartModal(region) {
             if (!region || region === 'NEM') return;
             activeRegion = region;
 
             chartTitle.textContent = `${region} — historical`;
+            const readout = document.getElementById("chartReadout");
+            if (readout) readout.textContent = "";
             const metric = chartMetricSelect.value;
             const windowKey = chartWindowSelect.value;
 
@@ -764,7 +836,9 @@
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
-                    interaction: { mode: 'index', intersect: false },
+                    
+                    events: ["mousemove","mouseout","click","touchstart","touchmove","pointerdown","pointermove"],
+interaction: { mode: 'index', intersect: false },
                     scales: {
                         x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 10 } },
                         y: { beginAtZero: false }
@@ -783,6 +857,9 @@
                     }
                 }
             });
+
+            // Enable “scrub to read values” on desktop + mobile
+            attachReadoutHandlers(popupChart, metric);
 
             chartOverlay.style.display = 'flex';
         }
