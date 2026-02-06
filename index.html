@@ -773,27 +773,117 @@
             const readout = document.getElementById('chartReadout');
             if (!canvas || !readout) return;
 
-            const updateFromEvent = (evt) => {
-                const points = chart.getElementsAtEventForMode(evt, 'index', { intersect: false }, true);
+            let isScrubbing = false;
+
+            // --- Double click / double tap to reset zoom ---
+            // Desktop: native dblclick event
+            canvas.addEventListener('dblclick', (e) => {
+                e.preventDefault();
+                try { chart.resetZoom(); } catch (_) {}
+            });
+
+            // Mobile: detect double-tap (two quick taps with minimal movement)
+            let lastTapMs = 0;
+            let touchStartX = null, touchStartY = null;
+            canvas.addEventListener('touchstart', (e) => {
+                if (!e.touches || !e.touches[0]) return;
+                touchStartX = e.touches[0].clientX;
+                touchStartY = e.touches[0].clientY;
+            }, { passive: true });
+
+            canvas.addEventListener('touchend', (e) => {
+                const now = Date.now();
+                const dt = now - lastTapMs;
+
+                // If we were scrubbing, don't treat as a tap.
+                if (isScrubbing) {
+                    lastTapMs = now;
+                    return;
+                }
+
+                // Estimate movement (if we have start coords)
+                let movedPx = 0;
+                if (touchStartX !== null && touchStartY !== null && e.changedTouches && e.changedTouches[0]) {
+                    const endX = e.changedTouches[0].clientX;
+                    const endY = e.changedTouches[0].clientY;
+                    movedPx = Math.hypot(endX - touchStartX, endY - touchStartY);
+                }
+
+                // Double tap threshold: 300ms, and finger didn't move much
+                if (dt > 0 && dt < 300 && movedPx < 12) {
+                    try { chart.resetZoom(); } catch (_) {}
+                    lastTapMs = 0; // reset so triple-tap doesn't immediately retrigger
+                } else {
+                    lastTapMs = now;
+                }
+            }, { passive: true });
+            function makeChartEvent(evt) {
+                // Chart.js expects mouse-like events (clientX/clientY + target).
+                // For touch events we convert the first touch point.
+                const t = evt.touches && evt.touches[0] ? evt.touches[0] : null;
+                const clientX = t ? t.clientX : evt.clientX;
+                const clientY = t ? t.clientY : evt.clientY;
+                return { clientX, clientY, target: canvas };
+            }
+
+            function updateFromEvent(evt) {
+                const e = makeChartEvent(evt);
+                const rect = canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+
+                const points = chart.getElementsAtEventForMode(e, 'index', { intersect: false }, true);
                 if (!points || !points.length) return;
+
                 const p = points[0];
                 const label = chart.data.labels[p.index];
                 const value = chart.data.datasets[p.datasetIndex].data[p.index];
+
+                // Update readout text
                 readout.textContent = `${label}  |  ${metric}: ${formatNumber(value)}`;
-            };
 
-            // Mouse / pointer
-            canvas.onpointerdown = (e) => { updateFromEvent(e); canvas.setPointerCapture?.(e.pointerId); };
-            canvas.onpointermove = (e) => { if (e.buttons) updateFromEvent(e); };
-            canvas.onpointerup = () => {};
+                // Force tooltip to follow finger/mouse
+                const active = [{ datasetIndex: p.datasetIndex, index: p.index }];
+                chart.setActiveElements(active);
+                if (chart.tooltip && chart.tooltip.setActiveElements) {
+                    chart.tooltip.setActiveElements(active, { x, y });
+                }
+                chart.update('none');
+            }
 
-            // Touch (some browsers don't route to pointer reliably)
-            canvas.ontouchstart = (e) => { if (e.touches?.[0]) updateFromEvent(e); };
-            canvas.ontouchmove = (e) => {
+            // Pointer (covers mouse + many mobile browsers)
+            canvas.addEventListener('pointerdown', (e) => {
+                isScrubbing = true;
+                updateFromEvent(e);
+                try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+            }, { passive: false });
+
+            canvas.addEventListener('pointermove', (e) => {
+                if (!isScrubbing) return;
+                updateFromEvent(e);
+            }, { passive: false });
+
+            function endScrub() { isScrubbing = false; }
+
+            canvas.addEventListener('pointerup', endScrub, { passive: true });
+            canvas.addEventListener('pointercancel', endScrub, { passive: true });
+            canvas.addEventListener('pointerleave', endScrub, { passive: true });
+
+            // Touch fallback (some browsers don't route pointer reliably inside canvas)
+            canvas.addEventListener('touchstart', (e) => {
+                isScrubbing = true;
+                updateFromEvent(e);
+            }, { passive: false });
+
+            canvas.addEventListener('touchmove', (e) => {
                 // prevent page scroll while scrubbing values
                 e.preventDefault();
+                if (!isScrubbing) return;
                 updateFromEvent(e);
-            };
+            }, { passive: false });
+
+            canvas.addEventListener('touchend', endScrub, { passive: true });
+            canvas.addEventListener('touchcancel', endScrub, { passive: true });
         }
 
         function openChartModal(region) {
