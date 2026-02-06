@@ -141,7 +141,80 @@
             font-weight: bold;
             box-shadow: 0 2px 4px rgba(0,0,0,0.2);
         }
+    
+        /* --- Popup chart modal --- */
+        #chartModalOverlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.45);
+            display: none;
+            z-index: 5000;
+            align-items: center;
+            justify-content: center;
+            padding: 14px;
+        }
+        #chartModal {
+            width: min(980px, 96vw);
+            height: min(640px, 90vh);
+            background: #fff;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        #chartModalHeader {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 10px 12px;
+            border-bottom: 1px solid #ddd;
+            background: #fafafa;
+            font-size: 13px;
+        }
+        #chartModalHeader .left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        #chartModalHeader .title {
+            font-weight: 700;
+        }
+        #chartModalHeader select, #chartModalHeader button {
+            font-size: 12px;
+            padding: 5px 8px;
+            border-radius: 6px;
+            border: 1px solid #bbb;
+            background: #fff;
+            cursor: pointer;
+        }
+        #chartModalBody {
+            padding: 10px;
+            flex: 1;
+            min-height: 0;
+        }
+        #chartCanvas {
+            width: 100%;
+            height: 100%;
+        }
+        #chartCloseBtn {
+            border: 1px solid #bbb;
+            background: #fff;
+            border-radius: 6px;
+            padding: 5px 9px;
+            cursor: pointer;
+        }
+        #chartCloseBtn:hover { background: #f0f0f0; }
+
     </style>
+
+    <!-- Chart.js (for popup charts) -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+
 </head>
 <body>
     <div id="map"></div>
@@ -172,6 +245,44 @@
 
             <div id="timelineContainer">
                 <canvas id="timelineCanvas"></canvas>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- Popup chart modal -->
+    <div id="chartModalOverlay">
+        <div id="chartModal" role="dialog" aria-modal="true">
+            <div id="chartModalHeader">
+                <div class="left">
+                    <span id="chartTitle" class="title">—</span>
+
+                    <label style="display:flex; gap:6px; align-items:center;">
+                        Metric
+                        <select id="chartMetricSelect">
+                            <option value="price" selected>price</option>
+                            <option value="cumul_price">cumul_price</option>
+                            <option value="demand">demand</option>
+                            <option value="generation">generation</option>
+                            <option value="availability">availability</option>
+                        </select>
+                    </label>
+
+                    <label style="display:flex; gap:6px; align-items:center;">
+                        Window
+                        <select id="chartWindowSelect">
+                            <option value="1">1 day</option>
+                            <option value="3">3 days</option>
+                            <option value="7" selected>7 days</option>
+                        </select>
+                    </label>
+
+                    <button id="resetZoomBtn" title="Reset zoom">Reset zoom</button>
+                </div>
+                <button id="chartCloseBtn" title="Close">Close</button>
+            </div>
+            <div id="chartModalBody">
+                <canvas id="chartCanvas"></canvas>
             </div>
         </div>
     </div>
@@ -233,6 +344,7 @@
         const INITIAL_ZOOM = 5.5;
 
         const map = L.map('map', { zoomControl: false }).setView([INITIAL_LAT, INITIAL_LON], INITIAL_ZOOM);
+        if (typeof Chart !== 'undefined' && typeof ChartZoom !== 'undefined') { Chart.register(ChartZoom); }
         L.control.zoom({ position: 'topright' }).addTo(map);
 
         L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
@@ -445,8 +557,13 @@
                     iconAnchor: [110, 70]
                 });
 
-                if (!markers[region]) markers[region] = L.marker(coords[region], { icon }).addTo(map);
-                else markers[region].setIcon(icon);
+                if (!markers[region]) {
+                    markers[region] = L.marker(coords[region], { icon }).addTo(map);
+                    // Click to open historical chart popup
+                    markers[region].on('click', () => openChartModal(region));
+                } else {
+                    markers[region].setIcon(icon);
+                }
             }
 
             // Interconnectors
@@ -562,12 +679,147 @@
         }
         animate();
 
+        // ---------------- Popup chart (7-day window + zoom) ----------------
+        const chartOverlay = document.getElementById('chartModalOverlay');
+        const chartCloseBtn = document.getElementById('chartCloseBtn');
+        const chartTitle = document.getElementById('chartTitle');
+        const chartMetricSelect = document.getElementById('chartMetricSelect');
+        const chartWindowSelect = document.getElementById('chartWindowSelect');
+        const resetZoomBtn = document.getElementById('resetZoomBtn');
+
+        let popupChart = null;
+        let activeRegion = null;
+
+        function computeWindowIndices(daysOrAll) {
+            if (!timeData || !timeData.length) return [];
+            if (daysOrAll === 'all') return [...Array(timeData.length).keys()];
+
+            const days = parseInt(daysOrAll, 10);
+            if (!Number.isFinite(days) || days <= 0) return [...Array(timeData.length).keys()];
+
+            const nowMs = Date.now();
+            const msBack = days * 24 * 60 * 60 * 1000;
+
+            const idx = [];
+            for (let i = 0; i < timeData.length; i++) {
+                const iso = `${timeData[i].date}T${timeData[i].time}:00`;
+                const t = Date.parse(iso);
+                if (Number.isFinite(t) && t >= (nowMs - msBack)) idx.push(i);
+            }
+            return idx.length ? idx : [...Array(timeData.length).keys()];
+        }
+
+        function buildSeries(region, metric, windowKey) {
+            const idx = computeWindowIndices(windowKey);
+            const labels = [];
+            const values = [];
+
+            for (const i of idx) {
+                const row = timeData[i];
+                const r = row.regions?.[region];
+                if (!r) continue;
+                const v = r[metric];
+                if (v === null || v === undefined) continue;
+                labels.push(`${row.date} ${row.time}`);
+                values.push(v);
+            }
+            return { labels, values };
+        }
+
+        function openChartModal(region) {
+            if (!region || region === 'NEM') return;
+            activeRegion = region;
+
+            chartTitle.textContent = `${region} — historical`;
+            const metric = chartMetricSelect.value;
+            const windowKey = chartWindowSelect.value;
+
+            const { labels, values } = buildSeries(region, metric, windowKey);
+
+            // If Chart.js not available, fail gracefully
+            if (typeof Chart === 'undefined') {
+                alert('Chart library did not load (Chart.js). Check internet access / CSP.');
+                return;
+            }
+
+            if (popupChart) {
+                popupChart.destroy();
+                popupChart = null;
+            }
+
+            const ctx = document.getElementById('chartCanvas').getContext('2d');
+
+            popupChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [{
+                        label: `${region} ${metric}`,
+                        data: values,
+                        pointRadius: 0,
+                        borderWidth: 2,
+                        tension: 0.15
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    scales: {
+                        x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 10 } },
+                        y: { beginAtZero: false }
+                    },
+                    plugins: {
+                        legend: { display: true },
+                        zoom: {
+                            pan: { enabled: true, mode: 'x' },
+                            zoom: {
+                                wheel: { enabled: true },
+                                pinch: { enabled: true },
+                                drag: { enabled: true },
+                                mode: 'x'
+                            }
+                        }
+                    }
+                }
+            });
+
+            chartOverlay.style.display = 'flex';
+        }
+
+        function closeChartModal() {
+            chartOverlay.style.display = 'none';
+        }
+
+        chartCloseBtn.addEventListener('click', closeChartModal);
+        chartOverlay.addEventListener('click', (e) => {
+            if (e.target === chartOverlay) closeChartModal();
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && chartOverlay.style.display === 'flex') closeChartModal();
+        });
+
+        chartMetricSelect.addEventListener('change', () => {
+            if (activeRegion) openChartModal(activeRegion);
+        });
+        chartWindowSelect.addEventListener('change', () => {
+            if (activeRegion) openChartModal(activeRegion);
+        });
+        resetZoomBtn.addEventListener('click', () => {
+            if (popupChart) popupChart.resetZoom();
+        });
+
         // controls
         const slider = document.getElementById('timeSlider');
         const playPauseBtn = document.getElementById('playPauseBtn');
         const backBtn = document.getElementById('backBtn');
         const topBtn = document.getElementById('topBtn');
         const speedSelect = document.getElementById('speedSelect');
+
+        let visibleIndices = [];
+        let visiblePosByActual = new Map();
+        let sliderIndex = 0;
 
         let autoPlayTimer = null;
         let isPlaying = false;
@@ -584,9 +836,12 @@
             playPauseBtn.textContent = 'Pause';
 
             autoPlayTimer = setInterval(() => {
-                let nextIndex = currentIndex + 1;
-                if (nextIndex >= timeData.length) nextIndex = 0;
-                slider.value = nextIndex;
+                if (!visibleIndices.length) return;
+                let nextPos = sliderIndex + 1;
+                if (nextPos >= visibleIndices.length) nextPos = 0;
+                sliderIndex = nextPos;
+                const nextIndex = visibleIndices[nextPos];
+                slider.value = nextPos;
                 updateDashboard(nextIndex);
             }, getAutoPlayIntervalMs());
         }
@@ -605,16 +860,21 @@
 
         slider.addEventListener('input', (e) => {
             stopAutoPlay();
-            updateDashboard(parseInt(e.target.value, 10));
+            sliderIndex = parseInt(e.target.value, 10);
+            const actualIndex = visibleIndices[sliderIndex] ?? 0;
+            updateDashboard(actualIndex);
         });
 
         backBtn.addEventListener('click', () => {
             if (!timeData || timeData.length === 0) return;
             stopAutoPlay();
-            let prev = currentIndex - 1;
-            if (prev < 0) prev = timeData.length - 1;
-            slider.value = prev;
-            updateDashboard(prev);
+            if (!visibleIndices.length) return;
+            let prevPos = sliderIndex - 1;
+            if (prevPos < 0) prevPos = visibleIndices.length - 1;
+            sliderIndex = prevPos;
+            const prevIndex = visibleIndices[prevPos];
+            slider.value = prevPos;
+            updateDashboard(prevIndex);
         });
 
         topBtn.addEventListener('click', () => map.setView([INITIAL_LAT, INITIAL_LON], INITIAL_ZOOM, { animate: true }));
@@ -631,11 +891,41 @@
 
         // init
         if (typeof timeData !== 'undefined' && timeData.length > 0) {
-            const lastIndex = timeData.length - 1;
-            slider.max = lastIndex;
-            slider.value = lastIndex;
+            // Build visible slider window = last 2 days (but keep full timeData for popup charts)
+            const nowMs = Date.now();
+            const twoDaysMs = 2 * 24 * 60 * 60 * 1000;
+
+            function toMs(d) {
+                // timeData entries have {date:'YYYY-MM-DD', time:'HH:MM'}
+                const iso = `${d.date}T${d.time}:00`;
+                const t = Date.parse(iso);
+                return Number.isFinite(t) ? t : NaN;
+            }
+
+            visibleIndices = [];
+            visiblePosByActual = new Map();
+            for (let i = 0; i < timeData.length; i++) {
+                const t = toMs(timeData[i]);
+                if (!Number.isFinite(t)) continue;
+                if (t >= (nowMs - twoDaysMs)) {
+                    visiblePosByActual.set(i, visibleIndices.length);
+                    visibleIndices.push(i);
+                }
+            }
+            // Fallback: if something went wrong, show everything
+            if (!visibleIndices.length) {
+                for (let i = 0; i < timeData.length; i++) {
+                    visiblePosByActual.set(i, i);
+                    visibleIndices.push(i);
+                }
+            }
+
+            slider.max = visibleIndices.length - 1;
+            sliderIndex = slider.max;
+            slider.value = sliderIndex;
+
             resizeTimelineCanvas();
-            updateDashboard(lastIndex);
+            updateDashboard(visibleIndices[sliderIndex]);
         } else {
             alert("Error: Data could not be loaded. Please ensure data.js is present and valid.");
         }
